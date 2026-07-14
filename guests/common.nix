@@ -10,6 +10,11 @@
       type = lib.types.str;
       description = "CLI flag to pass when --dangerous is enabled";
     };
+    acp = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Run the tool as an ACP agent with stdio on the llmjail.acp virtio-serial port instead of a TTY";
+    };
   };
 
   config = {
@@ -398,7 +403,7 @@
     # (`llmjail.winsize`) published by the host runner and applies them to
     # /dev/ttyS0 via stty. TIOCSWINSZ delivers SIGWINCH to ttyS0's foreground
     # process group, so the TUI resizes live without any QEMU patches.
-    systemd.services.llmjail-winsize = {
+    systemd.services.llmjail-winsize = lib.mkIf (!config.llmjail.acp) {
       description = "Apply terminal size updates from host via virtio-serial";
       wantedBy = [ "multi-user.target" ];
       before = [ "llmjail-tool.service" ];
@@ -446,9 +451,11 @@
           fi
 
           ARGS=()
-          if [ "''${LLMJAIL_DANGEROUS:-0}" = "1" ]; then
-            ARGS+=(${config.llmjail.dangerousFlag})
-          fi
+          ${lib.optionalString (config.llmjail.dangerousFlag != "") ''
+            if [ "''${LLMJAIL_DANGEROUS:-0}" = "1" ]; then
+              ARGS+=(${config.llmjail.dangerousFlag})
+            fi
+          ''}
 
           # Read null-separated tool args preserving argument boundaries
           if [ -s /llmjail-env/tool-args ]; then
@@ -468,6 +475,51 @@
           cd /workspace
           exec ${config.llmjail.toolBinary} "''${ARGS[@]}"
         '';
+
+        acpLauncher = pkgs.writeShellScript "launch-tool-acp" ''
+          set -euo pipefail
+
+          if [ -d /host-user-sw/bin ]; then
+            export PATH="/host-user-sw/bin:$PATH"
+          fi
+          if [ -d /host-sw/bin ]; then
+            export PATH="/host-sw/bin:$PATH"
+          fi
+
+          if [ -f /llmjail-env/dev-env ]; then
+            # shellcheck disable=SC1091
+            source /llmjail-env/dev-env
+          fi
+
+          ARGS=()
+          if [ -s /llmjail-env/tool-args ]; then
+            while IFS= read -r -d "" arg; do
+              ARGS+=("$arg")
+            done < /llmjail-env/tool-args
+          fi
+
+          cd /workspace
+          # Single RDWR open of the port, dup'd onto stdin/stdout. Two
+          # separate opens of a virtio-serial port are not reliable.
+          exec 3<>/dev/virtio-ports/llmjail.acp
+          exec ${config.llmjail.toolBinary} "''${ARGS[@]+"''${ARGS[@]}"}" 0<&3 1>&3
+        '';
+
+        # Wait for the virtio port device and hand it to the unprivileged
+        # user before the tool starts. Runs as root (ExecStartPre "+").
+        acpPortPrep = pkgs.writeShellScript "acp-port-prep" ''
+          set -eu
+          i=0
+          while [ ! -e /dev/virtio-ports/llmjail.acp ]; do
+            i=$((i + 1))
+            if [ "$i" -gt 300 ]; then
+              echo "llmjail.acp virtio port never appeared" >&2
+              exit 1
+            fi
+            ${pkgs.coreutils}/bin/sleep 0.1
+          done
+          ${pkgs.coreutils}/bin/chown user /dev/virtio-ports/llmjail.acp
+        '';
       in
       {
         description = "llmjail tool runner";
@@ -475,19 +527,30 @@
         after = [ "llmjail-mounts.service" "llmjail-net-filter.service" "network-online.target" ];
         wants = [ "llmjail-mounts.service" "llmjail-net-filter.service" "network-online.target" ];
         path = [ "/run/current-system/sw" ];
-        serviceConfig = {
-          User = "user";
-          WorkingDirectory = "/workspace";
-          EnvironmentFile = "/llmjail-env/env";
-          StandardInput = "tty";
-          StandardOutput = "tty";
-          StandardError = "tty";
-          TTYPath = "/dev/ttyS0";
-          TTYReset = true;
-          TTYVHangup = false;
-          ExecStart = "${launcher}";
-          ExecStopPost = "+${pkgs.systemd}/bin/systemctl poweroff --force --force";
-        };
+        serviceConfig =
+          if config.llmjail.acp then {
+            User = "user";
+            WorkingDirectory = "/workspace";
+            EnvironmentFile = "/llmjail-env/env";
+            StandardInput = "null";
+            StandardOutput = "journal";
+            StandardError = "journal";
+            ExecStartPre = "+${acpPortPrep}";
+            ExecStart = "${acpLauncher}";
+            ExecStopPost = "+${pkgs.systemd}/bin/systemctl poweroff --force --force";
+          } else {
+            User = "user";
+            WorkingDirectory = "/workspace";
+            EnvironmentFile = "/llmjail-env/env";
+            StandardInput = "tty";
+            StandardOutput = "tty";
+            StandardError = "tty";
+            TTYPath = "/dev/ttyS0";
+            TTYReset = true;
+            TTYVHangup = false;
+            ExecStart = "${launcher}";
+            ExecStopPost = "+${pkgs.systemd}/bin/systemctl poweroff --force --force";
+          };
       };
 
     systemd.services."serial-getty@ttyS0".enable = false;

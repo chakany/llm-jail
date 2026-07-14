@@ -16,10 +16,44 @@
       ];
     };
   };
+  claude-acp = {
+    guestModule = ./guests/claude-acp.nix;
+    defaults = {
+      mem = 4096; vcpu = 2;
+      acp = true;
+      configDirName = ".claude";
+      configEnvVar = "CLAUDE_CONFIG_DIR";
+      allowedDomains = [
+        "api.anthropic.com"
+        # OAuth login flows (claude.ai and Console accounts) - needed for the
+        # first-run login inside the jail
+        "claude.ai"
+        "platform.claude.com"
+        "statsig.anthropic.com"
+        "sentry.io"
+      ];
+    };
+  };
   codex = {
     guestModule = ./guests/codex.nix;
     defaults = {
       mem = 4096; vcpu = 2;
+      configDirName = ".codex";
+      configEnvVar = "CODEX_HOME";
+      allowedDomains = [
+        "api.openai.com"
+        # OAuth issuer for in-jail login (token exchange)
+        "auth.openai.com"
+        "chatgpt.com"
+        "sentry.io"
+      ];
+    };
+  };
+  codex-acp = {
+    guestModule = ./guests/codex-acp.nix;
+    defaults = {
+      mem = 4096; vcpu = 2;
+      acp = true;
       configDirName = ".codex";
       configEnvVar = "CODEX_HOME";
       allowedDomains = [

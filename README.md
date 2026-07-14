@@ -198,6 +198,127 @@ Default allowed domains per tool:
 >
 > Without `--dangerous`, the tool's own permission system is active and will prompt before taking sensitive actions. This is the recommended mode for most use cases.
 
+## ACP mode
+
+`llm-jail-claude-acp` runs the agent headless, speaking the
+[Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over a
+Unix socket) instead of a TTY. This is the integration surface for
+orchestrators such as Conductor: the workspace is still a 9p mount, the
+network is still domain-filtered, but the session is driven
+programmatically.
+
+```bash
+# Terminal 1: boot the jailed agent, exposing the ACP socket
+cd /path/to/workspace
+nix run .#claude-acp -- --acp-sock "$XDG_RUNTIME_DIR/acp.sock"
+
+# Terminal 2: drive it (see tests/acp-client.py for a minimal client)
+python3 tests/acp-client.py --sock "$XDG_RUNTIME_DIR/acp.sock" --prompt "…" --trace
+```
+
+Notes:
+- The socket accepts connections as soon as QEMU starts, but the guest
+  adapter opens the port a few seconds later; clients must retry
+  `initialize` until it answers (host→guest bytes sent before the guest
+  opens the port are dropped by virtio-serial).
+- Permission requests arrive as `session/request_permission` — the client
+  is the permission authority. There is no `--dangerous` in ACP mode.
+- There is no interactive login over the ACP channel, so provide
+  credentials up front: export `ANTHROPIC_API_KEY` (forwarded into the
+  VM), or pre-seed the jail-private state dir
+  `~/.config/llm-jail/claude-acp/default` before launching. Without
+  credentials the adapter answers `initialize`, but `session/new`
+  spawns a `claude` subprocess that reports `Not logged in · Please run
+  /login` and exits.
+- Keep `--acp-sock` short: it is a Unix socket path, capped at ~108
+  bytes by the kernel and QEMU. The default (`RUNDIR/acp.sock` under
+  `$TMPDIR`) is fine unless `$TMPDIR` is deeply nested.
+- The VM powers off when the ACP adapter process exits.
+- The socket is unauthenticated: anyone who can connect to it controls
+  the agent (workspace write access, forwarded API keys). Keep it in a
+  directory only you can access - the default under the runner's
+  `RUNDIR` is created `0700`.
+- `tests/acp-e2e.sh` is the full smoke test (KVM + credentials required).
+  It is parameterized by `ACP_TOOL` (default `claude-acp`), so
+  `ACP_TOOL=codex-acp tests/acp-e2e.sh` drives the Codex adapter instead.
+
+### codex-acp with an OpenAI-compatible provider (example: Novita)
+
+`codex-acp` (Zed's Rust ACP adapter for Codex) speaks the same ACP schema
+as `claude-acp`, so the same client (`tests/acp-client.py`) drives it
+unchanged. Codex can talk to any OpenAI-compatible endpoint by defining a
+custom `model_provider` in its `config.toml`. This example points it at
+[Novita](https://novita.ai)'s OpenAI-compatible API.
+
+1. Export the provider key and base URL. Both are forwarded into the VM by
+   the runner, and the runner auto-whitelists the base-URL host
+   (`https://api.novita.ai/v3/openai` → `api.novita.ai`) so the jail's
+   network filter lets the request through:
+
+   ```bash
+   export OPENAI_API_KEY="<your-novita-key>"
+   export OPENAI_BASE_URL="https://api.novita.ai/v3/openai"
+   ```
+
+2. Seed the jail-private Codex config. `codex-acp`'s state dir is mounted
+   at the guest's `$CODEX_HOME` (`/home/user/.codex`); on the host that is
+   `~/.config/llm-jail/codex-acp/default`. Codex reads `config.toml` from
+   there:
+
+   ```bash
+   mkdir -p ~/.config/llm-jail/codex-acp/default
+   cat > ~/.config/llm-jail/codex-acp/default/config.toml <<'TOML'
+   # Route Codex through Novita's OpenAI-compatible endpoint.
+   model = "glm-5.2"
+   model_provider = "novita"
+
+   # The microVM is itself the sandbox. Codex's own nested sandbox
+   # cannot run here (the ACP guest ships no bwrap), so disable it and
+   # surface any approvals over the ACP channel instead.
+   approval_policy = "never"
+   sandbox_mode = "danger-full-access"
+
+   [model_providers.novita]
+   name = "Novita"
+   base_url = "https://api.novita.ai/v3/openai"
+   # Codex reads the key from this env var (forwarded into the VM).
+   env_key = "OPENAI_API_KEY"
+   # Novita implements the OpenAI Chat Completions API, not the
+   # Responses API, so pin the wire protocol to "chat".
+   wire_api = "chat"
+   TOML
+   ```
+
+3. Run the e2e:
+
+   ```bash
+   ACP_TOOL=codex-acp tests/acp-e2e.sh
+   ```
+
+**Verified without credentials:** the transport is proven end-to-end —
+the VM boots, the host ACP socket is exposed, and `initialize`
+round-trips. `codex-acp` 0.16.0 advertises `authMethods` including
+`openai-api-key` (env var `OPENAI_API_KEY`), and `session/new` without
+credentials returns a clean JSON-RPC error
+(`{"code":-32000,"message":"Authentication required"}`) rather than
+crashing. The env forwarding (`OPENAI_API_KEY`, `OPENAI_BASE_URL`) and the
+base-URL domain auto-whitelist were verified in `lib/mkRunner.nix`, and the
+config field names (`model_provider`, `base_url`, `env_key`, `wire_api`,
+`approval_policy`, `sandbox_mode`) were confirmed present in the
+`codex-acp` 0.16.0 binary.
+
+**Confirmed by an authenticated run** (ChatGPT-OAuth auth path, no
+provider table): the full ACP flow works end to end, and
+`approval_policy = "never"` with `sandbox_mode = "danger-full-access"`
+lets the agent write the marker file. `workspace-write` does NOT work in
+the ACP guest — codex's nested sandbox needs `bwrap`, which the guest
+deliberately does not ship (the VM is the sandbox).
+
+**Still pending for Novita specifically:** that it accepts the `glm-5.2`
+model id and that `wire_api = "chat"` is the correct protocol. Adjust the
+model id and provider table to match whatever OpenAI-compatible endpoint
+you actually target.
+
 ## How it works
 
 ```

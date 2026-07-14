@@ -1,4 +1,4 @@
-{ pkgs, nixpkgs, claude-code, codex-cli, copilot-cli }:
+{ pkgs, nixpkgs, claude-code, codex-cli, copilot-cli, claude-agent-acp, codex-acp }:
 
 let
   mkSmokeTest = { name, guestModule, toolBinary }:
@@ -152,6 +152,174 @@ let
     '';
   };
 
+  # ACP mode: verify the tool service is wired to the virtio port and the
+  # winsize service is gone. Uses `cat` as a stand-in tool binary so the
+  # test does not depend on agent packages or credentials.
+  acpServiceTest = pkgs.testers.nixosTest {
+    name = "llmjail-acp-service-smoke";
+
+    nodes.machine = { lib, ... }: {
+      imports = [ ../guests/common.nix ];
+      _module.args = { inherit nixpkgs; };
+
+      llmjail.acp = true;
+      llmjail.toolBinary = "${pkgs.coreutils}/bin/cat";
+      llmjail.dangerousFlag = "";
+
+      fileSystems."/.nix-lower/store" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=1M" ];
+      };
+      fileSystems."/llmjail-env" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=10M" ];
+      };
+      boot.initrd.postMountCommands = lib.mkForce "";
+
+      systemd.tmpfiles.rules = [
+        "d /workspace 0755 user users -"
+        "f /llmjail-env/env 0644 root root - HOME=/home/user"
+        "f /llmjail-env/tool-args 0644 root root -"
+        "f /llmjail-env/allowed-domains 0644 root root -"
+      ];
+
+      # No virtio port exists in the test VM; keep the service defined but
+      # not started (same pattern as the other smoke tests).
+      systemd.services.llmjail-tool = {
+        wantedBy = lib.mkForce [ ];
+        serviceConfig.ExecStopPost = lib.mkForce "";
+      };
+
+      virtualisation.memorySize = 1024;
+    };
+
+    testScript = ''
+      machine.start()
+      machine.wait_for_unit("multi-user.target")
+
+      with subtest("tool service targets the journal, not a TTY"):
+          output = machine.succeed(
+              "systemctl show llmjail-tool.service -p StandardOutput,StandardError,TTYPath,User"
+          )
+          assert "StandardOutput=journal" in output, f"expected journal stdout: {output}"
+          assert "StandardError=journal" in output, f"expected journal stderr: {output}"
+          assert "TTYPath=/dev/ttyS0" not in output, f"unexpected TTYPath: {output}"
+          assert "User=user" in output, f"expected User=user: {output}"
+
+      with subtest("winsize service does not exist in ACP mode"):
+          machine.fail("systemctl cat llmjail-winsize.service")
+
+      with subtest("mounts service still works"):
+          machine.succeed("systemctl is-active llmjail-mounts.service")
+    '';
+  };
+
+  claudeAcpTest = pkgs.testers.nixosTest {
+    name = "llmjail-claude-acp-smoke";
+
+    nodes.machine = { lib, ... }: {
+      imports = [ ../guests/claude-acp.nix ];
+      _module.args = { inherit nixpkgs claude-agent-acp; };
+
+      fileSystems."/.nix-lower/store" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=1M" ];
+      };
+      fileSystems."/llmjail-env" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=10M" ];
+      };
+      boot.initrd.postMountCommands = lib.mkForce "";
+
+      systemd.tmpfiles.rules = [
+        "d /workspace 0755 user users -"
+        "f /llmjail-env/env 0644 root root - HOME=/home/user"
+        "f /llmjail-env/tool-args 0644 root root -"
+        "f /llmjail-env/allowed-domains 0644 root root -"
+      ];
+
+      systemd.services.llmjail-tool = {
+        wantedBy = lib.mkForce [ ];
+        serviceConfig.ExecStopPost = lib.mkForce "";
+      };
+
+      virtualisation.memorySize = 1024;
+    };
+
+    testScript = ''
+      machine.start()
+      machine.wait_for_unit("multi-user.target")
+
+      with subtest("ACP adapter binary exists"):
+          machine.succeed("test -x ${claude-agent-acp}/bin/claude-agent-acp")
+
+      with subtest("tool service uses journal stdio"):
+          output = machine.succeed(
+              "systemctl show llmjail-tool.service -p StandardOutput,StandardError"
+          )
+          assert "StandardOutput=journal" in output, f"expected journal: {output}"
+
+      with subtest("winsize service does not exist"):
+          machine.fail("systemctl cat llmjail-winsize.service")
+    '';
+  };
+
+  codexAcpTest = pkgs.testers.nixosTest {
+    name = "llmjail-codex-acp-smoke";
+
+    nodes.machine = { lib, ... }: {
+      imports = [ ../guests/codex-acp.nix ];
+      _module.args = { inherit nixpkgs codex-acp; };
+
+      fileSystems."/.nix-lower/store" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=1M" ];
+      };
+      fileSystems."/llmjail-env" = lib.mkForce {
+        device = "tmpfs";
+        fsType = "tmpfs";
+        options = [ "size=10M" ];
+      };
+      boot.initrd.postMountCommands = lib.mkForce "";
+
+      systemd.tmpfiles.rules = [
+        "d /workspace 0755 user users -"
+        "f /llmjail-env/env 0644 root root - HOME=/home/user"
+        "f /llmjail-env/tool-args 0644 root root -"
+        "f /llmjail-env/allowed-domains 0644 root root -"
+      ];
+
+      systemd.services.llmjail-tool = {
+        wantedBy = lib.mkForce [ ];
+        serviceConfig.ExecStopPost = lib.mkForce "";
+      };
+
+      virtualisation.memorySize = 1024;
+    };
+
+    testScript = ''
+      machine.start()
+      machine.wait_for_unit("multi-user.target")
+
+      with subtest("ACP adapter binary exists"):
+          machine.succeed("test -x ${codex-acp}/bin/codex-acp")
+
+      with subtest("tool service uses journal stdio"):
+          output = machine.succeed(
+              "systemctl show llmjail-tool.service -p StandardOutput,StandardError"
+          )
+          assert "StandardOutput=journal" in output, f"expected journal: {output}"
+
+      with subtest("winsize service does not exist"):
+          machine.fail("systemctl cat llmjail-winsize.service")
+    '';
+  };
+
 in
 {
   claude-smoke = mkSmokeTest {
@@ -173,4 +341,10 @@ in
   };
 
   net-filter-smoke = netFilterTest;
+
+  acp-service-smoke = acpServiceTest;
+
+  claude-acp-smoke = claudeAcpTest;
+
+  codex-acp-smoke = codexAcpTest;
 }

@@ -9,6 +9,7 @@ let
   toplevel = guest.config.system.build.toplevel;
   qemuPkg = pkgs.qemu_kvm;
   arch = if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64";
+  acpMode = toolDefaults.acp or false;
 in
 pkgs.writeShellApplication {
   name = "llm-jail-${name}";
@@ -35,7 +36,9 @@ pkgs.writeShellApplication {
     EXTRA_MOUNTS=()
     MASK_PATTERNS=()
     TOOL_ARGS=()
-
+    ${pkgs.lib.optionalString acpMode ''
+    ACP_SOCK=""
+    ''}
     PROFILE="''${LLMJAIL_PROFILE:-default}"
     STATE_DIR="''${LLMJAIL_STATE_DIR:-}"
     if [ -z "$STATE_DIR" ] && [ -n "''${LLMJAIL_CONFIG_DIR:-}" ]; then
@@ -66,7 +69,7 @@ pkgs.writeShellApplication {
       --allow-domain DOMAIN Add domain to network whitelist (repeatable)
       --no-net-filter       Disable network filtering (unrestricted access)
       --mem SIZE            Memory in MB (default: ${toString toolDefaults.mem})
-      --vcpu COUNT          vCPUs (default: ${toString toolDefaults.vcpu})
+      --vcpu COUNT          vCPUs (default: ${toString toolDefaults.vcpu})${pkgs.lib.optionalString acpMode "\n  --acp-sock PATH       Unix socket path for the ACP channel (default: RUNDIR/acp.sock)"}
       -h, --help            Show this help
 
     Press Ctrl-a x to force-quit QEMU.
@@ -105,7 +108,7 @@ pkgs.writeShellApplication {
         --mask)        MASK_PATTERNS+=("$2"); shift 2 ;;
         --store-disk)  STORE_DISK="$2"; shift 2 ;;
         --mem)         MEM="$2"; shift 2 ;;
-        --vcpu)        VCPU="$2"; shift 2 ;;
+        --vcpu)        VCPU="$2"; shift 2 ;;${pkgs.lib.optionalString acpMode "\n        --acp-sock)   ACP_SOCK=\"$2\"; shift 2 ;;"}
         -h|--help)     usage ;;
         --)            shift; TOOL_ARGS=("$@"); break ;;
         *)             echo "Unknown option: $1" >&2; usage ;;
@@ -150,7 +153,14 @@ pkgs.writeShellApplication {
       [ -d "$RUNDIR" ] && rm -rf "$RUNDIR"
     }
     CLEANUP_FUNCS+=(cleanup_rundir)
-
+    ${pkgs.lib.optionalString acpMode ''
+    if [ -z "$ACP_SOCK" ]; then
+      ACP_SOCK="$RUNDIR/acp.sock"
+    fi
+    validate_path "$ACP_SOCK" "acp socket path"
+    echo "llm-jail: ACP socket: $ACP_SOCK" >&2
+    ''}
+    ${pkgs.lib.optionalString (!acpMode) ''
     # TODO: QEMU has a pending patch series (v6, "console: add
     # TIOCSWINSZ support") that adds native SIGWINCH->virtconsole
     # forwarding. When those patches land upstream and reach nixpkgs,
@@ -212,7 +222,7 @@ pkgs.writeShellApplication {
     cleanup_winch() {
       kill "$WINCH_FWD_PID" 2>/dev/null
     }
-    CLEANUP_FUNCS+=(cleanup_winch)
+    CLEANUP_FUNCS+=(cleanup_winch)''}
 
     ENV_FILE="$RUNDIR/env"
     {
@@ -415,12 +425,13 @@ pkgs.writeShellApplication {
 
     # socat itself retries the UNIX-CONNECT until QEMU binds the socket,
     # so no polling loop is needed.
+    ${pkgs.lib.optionalString (!acpMode) ''
     socat -u "PIPE:$WINSIZE_FIFO" "UNIX-CONNECT:$WINSIZE_SOCK,retry=100,interval=0.1" 2>/dev/null &
     SOCAT_PID=$!
     cleanup_socat() {
       kill "$SOCAT_PID" 2>/dev/null
     }
-    CLEANUP_FUNCS+=(cleanup_socat)
+    CLEANUP_FUNCS+=(cleanup_socat)''}
 
     qemu-system-${arch} \
       "''${KVM_ARGS[@]}" \
@@ -430,11 +441,18 @@ pkgs.writeShellApplication {
       -initrd ${toplevel}/initrd \
       -append "$KERNEL_PARAMS" \
       -nographic \
-      -serial mon:stdio \
-      -serial file:"$RUNDIR/kernel.log" \
-      -device virtio-serial-pci \
-      -chardev "socket,id=winsize,path=$WINSIZE_SOCK,server=on,wait=off" \
-      -device virtserialport,chardev=winsize,name=llmjail.winsize \
+      ${/* NOTE: these single-line double-quoted arm strings, with their
+           explicit "\n" escapes, must splice into the QEMU invocation's
+           shell line-continuation below exactly as single-line strings;
+           rewriting an arm as an indented multi-line string breaks the
+           continuation (trailing-newline stacking) and non-ACP
+           byte-identity. The ACP arm needs no winsize chardev, so a
+           future virtio-console migration only needs to touch the else
+           arm. */ ""}${if acpMode then
+        "-serial file:\"$RUNDIR/tty.log\" \\\n  -serial file:\"$RUNDIR/kernel.log\" \\\n  -device virtio-serial-pci \\\n  -chardev \"socket,id=acp,path=$ACP_SOCK,server=on,wait=off\" \\\n  -device virtserialport,chardev=acp,name=llmjail.acp \\"
+      else
+        "-serial mon:stdio \\\n  -serial file:\"$RUNDIR/kernel.log\" \\\n  -device virtio-serial-pci \\\n  -chardev \"socket,id=winsize,path=$WINSIZE_SOCK,server=on,wait=off\" \\\n  -device virtserialport,chardev=winsize,name=llmjail.winsize \\"
+      }
       -no-reboot \
       -device virtio-rng-pci \
       -nic user,model=virtio-net-pci \

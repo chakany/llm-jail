@@ -27,10 +27,21 @@ This is a Nix flake that runs coding agents inside QEMU microVMs with hardware-l
 
 **Guest side (`guests/common.nix` + `guests/claude.nix`):** Minimal NixOS. Three systemd services: `llmjail-mounts` parses kernel cmdline (`llmjail.mounts=tag:path:mode,...`) to mount user directories via 9p; `llmjail-winsize` reads `cols rows` lines from a dedicated virtio-serial port (`/dev/virtio-ports/llmjail.winsize`) and applies them via `stty` on `/dev/ttyS0` so the TUI receives SIGWINCH on host terminal resize; then `llmjail-tool` runs the actual tool on `/dev/ttyS0`. `ExecStopPost` powers off the VM when the tool exits. The host runner forwards SIGWINCH into the winsize port via a FIFO→unix-socket→`virtserialport` bridge (`socat`), so no QEMU patches are required.
 
+ACP mode (`tools.nix` entries with `acp = true`, guest option `llmjail.acp`)
+replaces the TTY entirely: the tool's stdio is fd-dup'd onto
+`/dev/virtio-ports/llmjail.acp` (single RDWR open — two separate opens of a
+virtio port are unreliable), stderr goes to the journal, the winsize service
+is not defined, and the host runner (`--acp-sock PATH`) binds the port to a
+Unix socket chardev instead of bridging SIGWINCH. Serial consoles go to log
+files in RUNDIR, so the runner is safe to spawn from a daemon.
+
 **Adding a new tool:** Add an entry to `tools.nix` pointing to a new guest module under `guests/`. The guest module imports `common.nix` and overrides `systemd.services.llmjail-tool.serviceConfig.ExecStart`.
 
 ## Key Constraints
 
+- **virtio-serial drops host→guest writes until the guest opens the port.** ACP clients must retry `initialize`; don't "fix" this with sleeps in the runner.
+- **The ACP socket path is a Unix socket, capped at ~108 bytes** by the kernel and QEMU's chardev. The default lives under `$TMPDIR`; a deeply nested `$TMPDIR` (or `--acp-sock`) will fail with "UNIX socket path ... is too long".
+- **The ACP socket is an unauthenticated control channel.** Whoever can connect controls the guest agent, which holds forwarded API keys and a read-write workspace mount. There is no auth on the JSON-RPC channel itself - the trust boundary is filesystem permissions on the socket path. The default (`RUNDIR/acp.sock`) is safe because `RUNDIR` is created `0700`; a custom `--acp-sock` must live in an equally private directory.
 - **9p can't mount single files.** `.gitconfig` is copied into the envfs temp dir on the host and copied out to `$HOME` by the guest mounts service.
 - **Tool args use null-separated files** (`tool-args`) to preserve argument boundaries through the host→guest boundary. Don't use env vars for args with spaces.
 - **`/run` is remounted by systemd in stage 2**, so guest 9p mounts must not go under `/run`. The envfs mount is at `/llmjail-env`.
